@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::aggregate::mvcc_collector::MVCCFilterCollector;
 use crate::api::version::Version;
@@ -49,6 +49,7 @@ use tantivy::index::{Index, Order, SegmentId};
 use tantivy::query::{EnableScoring, QueryClone, QueryParser, Weight};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::vector::ivf::AdaptiveProbeParams;
+use tantivy::vector::{ProbeStats, ProbeTermination};
 use tantivy::{
     query::Query, schema::OwnedValue, DateTime, DocAddress, DocId, DocSet, Executor, IndexReader,
     ReloadPolicy, Score, Searcher, SegmentOrdinal, SegmentReader, TantivyDocument,
@@ -57,6 +58,50 @@ use tantivy::{
 /// The maximum number of sort-features/`OrderByInfo`s supported for
 /// `SearchIndexReader::search_top_k_in_segments`.
 pub const MAX_TOPK_FEATURES: usize = 5;
+
+/// Aggregate the per-segment IVF [`ProbeStats`] of one vector query into a
+/// single parseable `probe_stats …` line. Scalars sum across segments;
+/// `termination` is tallied per variant (so a `Ceiling` on any segment stays
+/// visible). The summed line preserves the per-segment invariant
+/// `visited == pruned_filter + pruned_dead + pruned_seen + scored`.
+fn format_probe_stats(per_segment: &[ProbeStats]) -> String {
+    let mut visited = 0usize;
+    let mut pruned_filter = 0usize;
+    let mut pruned_dead = 0usize;
+    let mut pruned_seen = 0usize;
+    let mut scored = 0usize;
+    let mut clusters_probed = 0usize;
+    let mut centroids_ranked = 0usize;
+    let mut min_candidates = 0usize;
+    let (mut ceiling, mut gate, mut exhausted) = (0usize, 0usize, 0usize);
+    for s in per_segment {
+        visited += s.vectors_visited;
+        pruned_filter += s.pruned_filter;
+        pruned_dead += s.pruned_dead;
+        pruned_seen += s.pruned_seen;
+        scored += s.candidates_scored;
+        clusters_probed += s.probed_clusters.len();
+        centroids_ranked += s.centroids_ranked;
+        min_candidates += s.min_candidates;
+        match s.termination {
+            ProbeTermination::Ceiling => ceiling += 1,
+            ProbeTermination::Gate => gate += 1,
+            ProbeTermination::Exhausted => exhausted += 1,
+        }
+    }
+    format!(
+        "probe_stats visited={visited} pruned_filter={pruned_filter} \
+         pruned_dead={pruned_dead} pruned_seen={pruned_seen} scored={scored} \
+         clusters_probed={clusters_probed} centroids_ranked={centroids_ranked} \
+         min_candidates={min_candidates} termination=ceiling:{ceiling},gate:{gate},exhausted:{exhausted}"
+    )
+}
+
+/// Emit the aggregated probe stats as one NOTICE. Only called when
+/// `paradedb.log_probe_stats` is on (off by default, zero-cost when off).
+fn emit_probe_stats_notice(per_segment: &[ProbeStats]) {
+    pgrx::notice!("{}", format_probe_stats(per_segment));
+}
 
 /// Represents a matching document from a tantivy search.  Typically, it is returned as an Iterator
 /// Item alongside the originating tantivy [`DocAddress`]
@@ -930,8 +975,22 @@ impl SearchIndexReader {
                         epsilon: crate::gucs::vector_cluster_probe_epsilon(),
                         ..Default::default()
                     });
+                // Probe-stats NOTICE (GUC `paradedb.log_probe_stats`, off by
+                // default, zero-cost when off). The collector pushes one
+                // ProbeStats per segment into the sink; we aggregate the scalars
+                // and tally `termination`, then emit a single line. This vector
+                // search runs once per scan, so the NOTICE is once per query.
+                let probe_stats_sink =
+                    crate::gucs::log_probe_stats().then(|| Arc::new(Mutex::new(Vec::new())));
+                let collector = match &probe_stats_sink {
+                    Some(sink) => collector.with_probe_stats_sink(Arc::clone(sink)),
+                    None => collector,
+                };
                 let (top_docs, aggregation_results) =
                     self.collect_maybe_auxiliary(segment_ids, collector, aux_collector);
+                if let Some(sink) = probe_stats_sink {
+                    emit_probe_stats_notice(&sink.lock().unwrap());
+                }
                 TopKSearchResults::new_for_score(top_docs, aggregation_results)
             }
         }
@@ -1566,5 +1625,45 @@ impl ErasedFeatures {
             OwnedValue::Null => None,
             _ => panic!("expected a f64 for the score"),
         })
+    }
+}
+
+#[cfg(test)]
+mod probe_stats_tests {
+    use super::*;
+
+    fn seg(termination: ProbeTermination) -> ProbeStats {
+        // visited (25) == pruned_filter(5) + pruned_dead(2) + pruned_seen(8) + scored(10).
+        ProbeStats {
+            probed_clusters: vec![0, 1, 2],
+            candidates_scored: 10,
+            vectors_visited: 25,
+            pruned_filter: 5,
+            pruned_dead: 2,
+            pruned_seen: 8,
+            centroids_ranked: 9,
+            min_candidates: 16,
+            termination,
+        }
+    }
+
+    #[test]
+    fn format_probe_stats_sums_scalars_and_tallies_termination() {
+        let line =
+            format_probe_stats(&[seg(ProbeTermination::Gate), seg(ProbeTermination::Ceiling)]);
+        // Scalars summed; termination tallied per variant; summed invariant
+        // holds (visited 50 == 10+4+16+20).
+        assert_eq!(
+            line,
+            "probe_stats visited=50 pruned_filter=10 pruned_dead=4 pruned_seen=16 scored=20 clusters_probed=6 centroids_ranked=18 min_candidates=32 termination=ceiling:1,gate:1,exhausted:0"
+        );
+    }
+
+    #[test]
+    fn format_probe_stats_empty() {
+        assert_eq!(
+            format_probe_stats(&[]),
+            "probe_stats visited=0 pruned_filter=0 pruned_dead=0 pruned_seen=0 scored=0 clusters_probed=0 centroids_ranked=0 min_candidates=0 termination=ceiling:0,gate:0,exhausted:0"
+        );
     }
 }
