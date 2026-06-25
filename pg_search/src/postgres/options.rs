@@ -202,7 +202,7 @@ fn cstr_to_rust_str(value: *const std::os::raw::c_char) -> String {
         .to_string()
 }
 
-const NUM_REL_OPTS: usize = 21;
+const NUM_REL_OPTS: usize = 19;
 #[pg_guard]
 pub unsafe extern "C-unwind" fn amoptions(
     reloptions: pg_sys::Datum,
@@ -338,23 +338,9 @@ pub unsafe extern "C-unwind" fn amoptions(
             isset_offset: 0,
         },
         pg_sys::relopt_parse_elt {
-            optname: "max_replicas_per_vector".as_pg_cstr(),
+            optname: "replicas".as_pg_cstr(),
             opttype: pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset: std::mem::offset_of!(BM25IndexOptionsData, max_replicas_per_vector) as i32,
-            #[cfg(feature = "pg18")]
-            isset_offset: 0,
-        },
-        pg_sys::relopt_parse_elt {
-            optname: "max_replicas_per_cluster".as_pg_cstr(),
-            opttype: pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset: std::mem::offset_of!(BM25IndexOptionsData, max_replicas_per_cluster) as i32,
-            #[cfg(feature = "pg18")]
-            isset_offset: 0,
-        },
-        pg_sys::relopt_parse_elt {
-            optname: "replica_epsilon".as_pg_cstr(),
-            opttype: pg_sys::relopt_type::RELOPT_TYPE_REAL,
-            offset: std::mem::offset_of!(BM25IndexOptionsData, replica_epsilon) as i32,
+            offset: std::mem::offset_of!(BM25IndexOptionsData, replicas) as i32,
             #[cfg(feature = "pg18")]
             isset_offset: 0,
         },
@@ -459,16 +445,8 @@ impl BM25IndexOptions {
         self.options_data().min_posting_len()
     }
 
-    pub fn max_replicas_per_vector(&self) -> Option<usize> {
-        self.options_data().max_replicas_per_vector()
-    }
-
-    pub fn max_replicas_per_cluster(&self) -> Option<usize> {
-        self.options_data().max_replicas_per_cluster()
-    }
-
-    pub fn replica_epsilon(&self) -> Option<f32> {
-        self.options_data().replica_epsilon()
+    pub fn replicas(&self) -> usize {
+        self.options_data().replicas()
     }
 
     pub fn key_field_name(&self) -> FieldName {
@@ -766,9 +744,7 @@ struct BM25IndexOptionsData {
     training_samples_per_centroid: i32,
     max_posting_len: i32,
     min_posting_len: i32,
-    max_replicas_per_vector: i32,
-    max_replicas_per_cluster: i32,
-    replica_epsilon: f64,
+    replicas: i32,
 }
 
 impl BM25IndexOptionsData {
@@ -840,35 +816,14 @@ impl BM25IndexOptionsData {
         }
     }
 
-    /// Max clusters a boundary vector is replicated into beyond its primary.
-    /// `None` (the unset sentinel `-1`) defers to the clusterer default, which
-    /// has replication ON. An explicit `0` turns replication OFF (Phase-1
-    /// behavior, byte-identical output) — the isolation knob.
-    pub fn max_replicas_per_vector(&self) -> Option<usize> {
-        if self.max_replicas_per_vector < 0 {
-            None
+    /// Total cells a vector is written into (SPANN `ReplicaCount`): the primary
+    /// plus up to `replicas - 1` HNSW-nearest cells. `1` (the default) is
+    /// primary-only. Any non-positive value is treated as `1`.
+    pub fn replicas(&self) -> usize {
+        if self.replicas <= 0 {
+            1
         } else {
-            Some(self.max_replicas_per_vector as usize)
-        }
-    }
-
-    /// Per-cluster replica budget. `None` (unset sentinel `0`) defers to the
-    /// driver default (≈ `max_posting_len / 2`).
-    pub fn max_replicas_per_cluster(&self) -> Option<usize> {
-        if self.max_replicas_per_cluster <= 0 {
-            None
-        } else {
-            Some(self.max_replicas_per_cluster as usize)
-        }
-    }
-
-    /// ε₁ closure factor for replica candidacy. `None` (unset sentinel
-    /// `<= 0`) defers to the clusterer default (`DEFAULT_REPLICA_EPSILON`).
-    pub fn replica_epsilon(&self) -> Option<f32> {
-        if self.replica_epsilon <= 0.0 {
-            None
-        } else {
-            Some(self.replica_epsilon as f32)
+            self.replicas as usize
         }
     }
 
@@ -1124,30 +1079,11 @@ pub unsafe fn init() {
     );
     pg_sys::add_int_reloption(
         RELOPT_KIND_PDB,
-        "max_replicas_per_vector".as_pg_cstr(),
-        "Max clusters a boundary vector is replicated into beyond its primary (default on; 0 = off)".as_pg_cstr(),
-        -1,
-        -1,
+        "replicas".as_pg_cstr(),
+        "Cells a vector is written into: primary + up to replicas-1 HNSW-nearest cells (1 = no replication)".as_pg_cstr(),
+        1,
+        1,
         i32::MAX,
-        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
-    );
-    pg_sys::add_int_reloption(
-        RELOPT_KIND_PDB,
-        "max_replicas_per_cluster".as_pg_cstr(),
-        "Per-cluster replica budget; nearest kept (0 = driver default ~max_posting_len/2)"
-            .as_pg_cstr(),
-        0,
-        0,
-        i32::MAX,
-        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
-    );
-    pg_sys::add_real_reloption(
-        RELOPT_KIND_PDB,
-        "replica_epsilon".as_pg_cstr(),
-        "ε1 closure factor: replicate to centroids within epsilon x nearest distance (0 = clusterer default)".as_pg_cstr(),
-        0.0,
-        0.0,
-        1.0e6,
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
     );
 }
