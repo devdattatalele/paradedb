@@ -418,6 +418,72 @@ fn index_info(
     Ok(TableIterator::new(results))
 }
 
+/// Returns the raw per-cluster IVF posting-list sizes for `index`, one row per
+/// cluster per segment. Read-only companion to [`index_info`]: where that
+/// collapses the per-cluster distribution into min/max/avg, this surfaces the
+/// full array so tooling can plot the real cluster-size distribution. Reuses
+/// `index_info`'s vector-field resolution and segment iteration verbatim.
+/// Segments without an IVF vector field contribute no rows.
+#[allow(clippy::type_complexity)]
+#[pg_extern]
+fn ivf_cluster_sizes(
+    index: PgRelation,
+) -> anyhow::Result<
+    TableIterator<
+        'static,
+        (
+            name!(segno, String),
+            name!(field, String),
+            name!(cluster_ord, i32),
+            name!(size, i64),
+        ),
+    >,
+> {
+    // # Safety
+    //
+    // Lock the index relation until the end of this function (read-only,
+    // AccessShareLock) so it is not dropped or altered while we read it —
+    // identical to `index_info`.
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
+    let index_kind = IndexKind::for_index(index.clone())?;
+    if !index.is_usable() {
+        return Ok(TableIterator::new(Vec::new()));
+    }
+
+    let mut rows = Vec::new();
+    for index in index_kind.partitions() {
+        if !index.is_usable() {
+            continue;
+        }
+        let search_reader = SearchIndexReader::empty(&index, MvccSatisfies::Snapshot)?;
+        let vector_field = search_reader
+            .schema()
+            .fields()
+            .find_map(|(field, field_entry)| {
+                let field_name: FieldName = field_entry.name().into();
+                matches!(
+                    search_reader.schema().get_field_type(field_entry.name()),
+                    Some(SearchFieldType::Vector(..))
+                )
+                .then_some((field, field_name.to_string()))
+            });
+        let Some((field, field_name)) = vector_field else {
+            continue;
+        };
+        for segment_reader in search_reader.segment_readers() {
+            let Some(sizes) = segment_reader.vector_cluster_sizes(field)? else {
+                continue;
+            };
+            let segno = segment_reader.segment_id().short_uuid_string();
+            for (i, size) in sizes.into_iter().enumerate() {
+                rows.push((segno.clone(), field_name.clone(), i as i32, size as i64));
+            }
+        }
+    }
+
+    Ok(TableIterator::new(rows))
+}
+
 /// Returns the list of segments that contain the specified [`pg_sys::ItemPointerData]` heap tuple
 /// identifier.
 ///
