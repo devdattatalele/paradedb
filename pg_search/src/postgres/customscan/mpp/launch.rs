@@ -48,7 +48,8 @@ use crate::postgres::customscan::joinscan::scan_state::{
 use crate::postgres::customscan::mpp::dispatch::{build_dispatch_payload, dispatch_plan_capacity};
 use crate::postgres::customscan::mpp::exec_worker::{run_mpp_worker, MppWorkerInputs};
 use crate::postgres::customscan::mpp::glue::{
-    estimate_dsm_size, leader_setup, producer_worker_count, worker_setup, MppLeaderState,
+    estimate_dsm_size, leader_setup, producer_worker_count, release_control_senders_on_detach,
+    worker_setup, MppLeaderState,
 };
 use crate::postgres::{ParallelScanArgs, ParallelScanState};
 
@@ -278,6 +279,18 @@ fn launch_mpp(
         Ok(l) => l,
         Err(e) => pgrx::error!("mpp: leader_setup failed: {e}"),
     };
+
+    // Registered here (not in `leader_setup`) because this is the first point with both the segment
+    // (`finish`) and the senders (`leader`) in hand. See [`release_control_senders_on_detach`].
+    unsafe {
+        pg_sys::on_dsm_detach(
+            finish.dsm_segment(),
+            Some(release_control_senders_on_detach),
+            pg_sys::Datum::from(std::sync::Arc::into_raw(std::sync::Arc::clone(
+                &leader.control_senders,
+            )) as *mut c_void),
+        );
+    }
 
     // Release the workers into ring attach + plan wait.
     go.store(GO_RUN, Ordering::Release);

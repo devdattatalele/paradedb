@@ -129,9 +129,10 @@ pub struct MppLeaderState {
     ///
     /// Dropping one of these decrements a counter inside the DSM ring, so they must never
     /// outlive the mapping: [`MppLeaderState::release_control_senders`] clears them from
-    /// `shutdown_custom_scan` on the success path, and a transaction-abort callback (registered
-    /// in [`leader_setup`]) clears them on the error path, both before PG detaches the DSM.
-    /// The scan state's own drop runs after detach and must find this empty.
+    /// `shutdown_custom_scan` on the success path, and [`release_control_senders_on_detach`]
+    /// (registered via `on_dsm_detach` by `launch`) clears them on every other path — abort, and a
+    /// `proc_exit` from `pg_terminate_backend` that skips shutdown — always before PG unmaps the
+    /// segment. The scan state's own drop runs after detach and must find this empty.
     pub control_senders: Arc<std::sync::Mutex<Vec<Option<MppSender>>>>,
     /// Plans for [`deliver_set_plans`], which runs at exec time when the launched workers are
     /// draining their inboxes. Sending from the init callback instead could fill a small ring
@@ -215,14 +216,9 @@ pub unsafe fn leader_setup(
     }
     let control_senders = Arc::new(std::sync::Mutex::new(attach.outbound_senders));
     // Hand the senders to the mesh too, so its early-termination cancel can reach the producers.
-    // The mesh shares this `Arc`, so clearing it below releases both views before the DSM unmaps.
+    // The mesh shares this `Arc`, so clearing either view releases both before the DSM unmaps.
     mesh.set_cancel_senders(Arc::clone(&control_senders));
-    // On abort, PG detaches the DSM before the portal contexts (and the scan state inside them)
-    // are cleaned up; release the DSM-backed senders while the mapping is still alive.
-    let on_abort = Arc::clone(&control_senders);
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
-        on_abort.lock().unwrap().clear();
-    });
+    // Released before the DSM unmaps via [`release_control_senders_on_detach`], registered by `launch`.
     Ok(MppLeaderState {
         mesh,
         control_senders,
@@ -233,9 +229,36 @@ pub unsafe fn leader_setup(
     })
 }
 
+/// `on_dsm_detach` callback that releases the leader's DSM-backed control senders while the MPP
+/// segment is still mapped.
+///
+/// Dropping a sender decrements an atomic inside the ring, which lives in the parallel-context
+/// DSM, so it must happen before PG unmaps that segment. `on_dsm_detach` runs while the mapping is
+/// still live, on every teardown path. A transaction-abort callback can't replace it: it fires
+/// after `AtEOXact_Parallel` has already detached the DSM, and a backend FATAL skips
+/// `shutdown_custom_scan` entirely.
+///
+/// `arg` is the senders `Arc`, leaked via `Arc::into_raw` at registration; reclaiming it here
+/// balances that. Idempotent — `clear` on the already-empty Vec (success path) is a no-op.
+#[pgrx::pg_guard]
+pub(crate) unsafe extern "C-unwind" fn release_control_senders_on_detach(
+    _seg: *mut pg_sys::dsm_segment,
+    arg: pg_sys::Datum,
+) {
+    let senders =
+        unsafe { Arc::from_raw(arg.cast_mut_ptr::<std::sync::Mutex<Vec<Option<MppSender>>>>()) };
+    // Tolerate a poisoned mutex rather than panic across the C boundary; the Vec data is still
+    // valid to clear.
+    let mut guard = senders
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
+}
+
 impl MppLeaderState {
     /// Drop the DSM-backed control senders while the mapping is still attached. Called from
-    /// `shutdown_custom_scan`; the abort callback covers the error path. Idempotent.
+    /// `shutdown_custom_scan` on the success path; [`release_control_senders_on_detach`] (registered
+    /// via `on_dsm_detach`) covers every other teardown path. Idempotent.
     pub fn release_control_senders(&self) {
         self.control_senders.lock().unwrap().clear();
     }
