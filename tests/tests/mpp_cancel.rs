@@ -21,13 +21,11 @@
 //! running MPP query from a second connection and assert a witness connection kept open the whole
 //! time survives — a cluster reset would have dropped it.
 
-mod fixtures;
-
 use anyhow::Result;
-use fixtures::*;
 use rstest::*;
 use sqlx::{Executor, PgConnection};
 use std::time::{Duration, Instant};
+use tests::fixtures::*;
 use tokio::time::sleep;
 
 // Three 20k-row tables. `age` is in [0,50), so `users.age = products.age` fans out to millions of
