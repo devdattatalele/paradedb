@@ -25,7 +25,7 @@ use crate::aggregate::mvcc_collector::MVCCFilterCollector;
 use crate::api::version::Version;
 use crate::api::{FieldName, HashMap, OrderByFeature, OrderByInfo, SortDirection};
 use crate::index::mvcc::MvccSatisfies;
-use crate::index::reader::scorer::{DeferredScorer, ScorerIter};
+use crate::index::reader::scorer::{DeferredScorer, LazyWeight, ScorerIter};
 use crate::index::setup_tokenizers;
 use crate::postgres::heap::VisibilityChecker;
 use crate::postgres::options::{SortByDirection, SortByField};
@@ -650,16 +650,16 @@ impl SearchIndexReader {
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
     ) -> MultiSegmentSearchResults {
+        let weight = Arc::new(LazyWeight::new(
+            self.query().box_clone(),
+            self.need_scores,
+            self.searcher.clone(),
+        ));
         let iterators = self
             .segment_readers_in_segments(segment_ids)
             .map(|(segment_ord, segment_reader)| {
                 ScorerIter::new(
-                    DeferredScorer::new(
-                        self.query().box_clone(),
-                        self.need_scores,
-                        segment_reader.clone(),
-                        self.searcher.clone(),
-                    ),
+                    DeferredScorer::new(Arc::clone(&weight), segment_reader.clone()),
                     segment_ord,
                     segment_reader.clone(),
                 )
@@ -721,8 +721,11 @@ impl SearchIndexReader {
             source_idx,
         };
         let searcher = self.searcher.clone();
-        let query = self.query.box_clone();
-        let need_scores = self.need_scores;
+        let weight = Arc::new(LazyWeight::new(
+            self.query.box_clone(),
+            self.need_scores,
+            searcher.clone(),
+        ));
 
         let lazy_iterators = segment_ids.map(move |segment_id| {
             let (segment_ord, segment_reader) = searcher
@@ -734,12 +737,7 @@ impl SearchIndexReader {
             let segment_ord = segment_ord as SegmentOrdinal;
 
             ScorerIter::new(
-                DeferredScorer::new(
-                    query.box_clone(),
-                    need_scores,
-                    segment_reader.clone(),
-                    searcher.clone(),
-                ),
+                DeferredScorer::new(Arc::clone(&weight), segment_reader.clone()),
                 segment_ord,
                 segment_reader.clone(),
             )
