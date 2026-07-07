@@ -11,9 +11,6 @@ on:
     - cron: "0 7 * * *" # daily 07:00 UTC (~2am ET)
   pull_request:
     types: [opened, synchronize, reopened]
-    branches:
-      - main
-      - 0.*.x # Release branches
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -156,7 +153,7 @@ jobs:
       - name: Install pgvector (system)
         if: matrix.pg_impl == 'system'
         run: |
-          git clone --branch v0.8.2 https://github.com/pgvector/pgvector.git
+          git clone --branch v0.8.4 https://github.com/pgvector/pgvector.git
           cd pgvector/
           sudo PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config make -j
           sudo PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config make install -j
@@ -164,7 +161,7 @@ jobs:
       - name: Install pgvector (pgrx)
         if: matrix.pg_impl == 'pgrx'
         run: |
-          git clone --branch v0.8.2 https://github.com/pgvector/pgvector.git
+          git clone --branch v0.8.4 https://github.com/pgvector/pgvector.git
           cd pgvector/
           PG_CONFIG=~/.pgrx/${{ matrix.pg_version }}.*/pgrx-install/bin/pg_config make -j
           PG_CONFIG=~/.pgrx/${{ matrix.pg_version }}.*/pgrx-install/bin/pg_config make install -j
