@@ -1034,10 +1034,19 @@ impl JoinScan {
             query: vec![],
             with_aggregates: false,
         };
+        // A pure join's mesh carries only narrow broadcast and shuffle batches, so it reserves
+        // the smaller ring and skips most of the DSM-commit launch cost. A DISTINCT join runs a
+        // partial aggregate whose frame can burst, so it keeps the full queue.
+        let queue_size = if state.custom_state().join_clause.has_distinct {
+            crate::gucs::mpp_queue_size()
+        } else {
+            crate::gucs::mpp_queue_size().min(crate::gucs::PURE_JOIN_QUEUE_MAX)
+        };
         if let Some(prep) = crate::postgres::customscan::mpp::launch::prepare_mpp_join(
             plan_bytes.len(),
             args,
             partitioning_idx,
+            queue_size,
         ) {
             // The leader runs the top fragment itself. When a non-partitioning source lands there
             // (the SEMI/ANTI broadcast strategy), its scan claims per-source segments against the

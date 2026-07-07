@@ -45,9 +45,7 @@ use datafusion_distributed::TaskKey;
 
 use crate::postgres::customscan::mpp::dispatch::StagePlan;
 
-use crate::gucs::{
-    enable_mpp, mpp_queue_size as gucs_mpp_queue_size, mpp_worker_count as gucs_mpp_worker_count,
-};
+use crate::gucs::{enable_mpp, mpp_worker_count as gucs_mpp_worker_count};
 use crate::postgres::customscan::mpp::pg_seams::{pack_receiver, PgInterrupt, PgWakeup};
 use crate::postgres::ParallelScanState;
 
@@ -92,17 +90,11 @@ pub fn mpp_worker_count() -> u32 {
 // must agree or the rings would be misaligned, which is UB-class.
 const _: () = assert!(pg_sys::MAXIMUM_ALIGNOF == 8);
 
-/// Per-edge queue size from the GUC.
-pub(super) fn mpp_queue_size() -> usize {
-    gucs_mpp_queue_size()
-}
-
 /// Body of `estimate_dsm_custom_scan`. Returns the total DSM bytes the leader will need
 /// for the header, the worker plan, and one MPSC inbox per process. `n_procs` is the
 /// total proc count (leader + `producer_worker_count()` parallel workers).
-pub fn estimate_dsm_size(plan_bytes_len: usize) -> Result<usize, String> {
-    shm::dsm_region_bytes(mpp_worker_count(), mpp_queue_size(), plan_bytes_len)
-        .map_err(|e| e.to_string())
+pub fn estimate_dsm_size(queue_size: usize, plan_bytes_len: usize) -> Result<usize, String> {
+    shm::dsm_region_bytes(mpp_worker_count(), queue_size, plan_bytes_len).map_err(|e| e.to_string())
 }
 
 /// Number of producer workers PG should launch as `parallel_workers`.
@@ -181,6 +173,7 @@ pub unsafe fn leader_setup(
     coordinate: *mut c_void,
     plan_bytes: Vec<u8>,
     stage_plans: Vec<StagePlan>,
+    queue_size: usize,
 ) -> Result<MppLeaderState, String> {
     let wakeup: Arc<dyn Wakeup> = Arc::new(PgWakeup);
     let interrupt: Arc<dyn Interrupt> = Arc::new(PgInterrupt);
@@ -194,7 +187,7 @@ pub unsafe fn leader_setup(
         shm::leader_setup(
             coordinate,
             mpp_worker_count(),
-            mpp_queue_size(),
+            queue_size,
             &plan_bytes,
             wakeup,
             token,

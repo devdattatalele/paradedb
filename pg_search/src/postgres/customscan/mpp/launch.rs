@@ -216,6 +216,10 @@ pub struct MppLaunchPrep {
     pub non_partitioning_segments: Vec<crate::api::HashSet<tantivy::index::SegmentId>>,
     producer_count: u32,
     payload_capacity: usize,
+    /// The per-edge ring size this launch reserved. `launch_mpp_commit`'s `leader_setup` must
+    /// lay the rings out at the same size the region was allocated for, so it rides on the prep
+    /// instead of being re-read from the GUC (which a pure join scales down below).
+    queue_size: usize,
 }
 
 /// Build the MPP DSM (mesh region, `ParallelScanState`, go flag) and spawn the workers parked
@@ -226,6 +230,7 @@ fn launch_mpp_prepare(
     args: ParallelScanArgs,
     partitioning_source_idx: usize,
     worker_entrypoint: &'static str,
+    queue_size: usize,
 ) -> Option<MppLaunchPrep> {
     let producer_count = producer_worker_count();
     let payload_capacity = dispatch_plan_capacity(plan_bytes_len);
@@ -247,7 +252,7 @@ fn launch_mpp_prepare(
         return None;
     }
 
-    let region_bytes = match estimate_dsm_size(payload_capacity) {
+    let region_bytes = match estimate_dsm_size(queue_size, payload_capacity) {
         Ok(sz) => sz,
         Err(e) => {
             pgrx::warning!("mpp: estimate_dsm failed: {e}; running serially");
@@ -292,6 +297,7 @@ fn launch_mpp_prepare(
         non_partitioning_segments,
         producer_count,
         payload_capacity,
+        queue_size,
     })
 }
 
@@ -310,6 +316,7 @@ pub fn launch_mpp_commit(
         non_partitioning_segments: _,
         producer_count,
         payload_capacity,
+        queue_size,
     } = prep;
 
     // Derive the per-stage subplans from the plan the leader itself will execute. A failure
@@ -353,7 +360,7 @@ pub fn launch_mpp_commit(
         Ok(Some(s)) => s.as_mut_ptr() as *mut c_void,
         _ => pgrx::error!("mpp: mesh region missing"),
     };
-    let mut leader = match unsafe { leader_setup(mesh_ptr, payload, stage_plans) } {
+    let mut leader = match unsafe { leader_setup(mesh_ptr, payload, stage_plans, queue_size) } {
         Ok(l) => l,
         Err(e) => pgrx::error!("mpp: leader_setup failed: {e}"),
     };
@@ -366,7 +373,8 @@ pub fn launch_mpp_commit(
     Some(leader)
 }
 
-/// AggregateScan prepare entry: aggregate worker symbol.
+/// AggregateScan prepare entry: aggregate worker symbol. Aggregates can burst a large
+/// partial-aggregate frame through the post-agg mesh, so they reserve the full queue.
 pub fn prepare_mpp_aggregate(
     plan_bytes_len: usize,
     args: ParallelScanArgs,
@@ -377,19 +385,24 @@ pub fn prepare_mpp_aggregate(
         args,
         partitioning_source_idx,
         "mpp_launched_worker_agg",
+        crate::gucs::mpp_queue_size(),
     )
 }
 
-/// JoinScan prepare entry: join worker symbol.
+/// JoinScan prepare entry: join worker symbol. `queue_size` is the caller's choice: a pure join
+/// (no DISTINCT) ships only narrow batches and passes the smaller [`crate::gucs::PURE_JOIN_QUEUE_MAX`]
+/// cap; a DISTINCT join passes the full `mpp_queue_size` since its post-agg mesh can burst.
 pub fn prepare_mpp_join(
     plan_bytes_len: usize,
     args: ParallelScanArgs,
     partitioning_source_idx: usize,
+    queue_size: usize,
 ) -> Option<MppLaunchPrep> {
     launch_mpp_prepare(
         plan_bytes_len,
         args,
         partitioning_source_idx,
         "mpp_launched_worker_join",
+        queue_size,
     )
 }

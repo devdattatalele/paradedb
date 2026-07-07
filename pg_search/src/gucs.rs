@@ -160,18 +160,30 @@ static MPP_WORKER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static MPP_MIN_ROWS: GucSetting<i32> = GucSetting::<i32>::new(500_000);
 
 /// Per-edge shm_mq queue size in bytes. Each MPP query allocates
-/// `num_meshes × N×(N-1) × mpp_queue_size` of dynamic shared memory: at
-/// N=4 with 3 meshes (group-by aggregate's worst case) the default 64 MiB
-/// produces ~2.3 GiB per query, sized so a ~100 MiB Partial-aggregate burst
-/// on the post-agg mesh fits without backpressure. Operators on memory-
-/// constrained boxes will want to dial this down; that's the explicit
-/// reason it's exposed instead of held as a `pub const`.
+/// `num_meshes × N×(N-1) × mpp_queue_size` of dynamic shared memory, and
+/// Postgres commits the whole region on creation (`posix_fallocate` in the
+/// Linux DSM path, to avoid a later SIGBUS under overcommit), so the region
+/// size is a fixed per-query launch cost. At N=4 with 3 meshes the default
+/// 64 MiB produces ~2.3 GiB per query, sized so a ~100 MiB Partial-aggregate
+/// burst on the post-agg mesh fits without backpressure — one such frame must
+/// fit a single ring whole, which sets this floor. Operators on memory-
+/// constrained boxes will want to dial this down; that's the explicit reason
+/// it's exposed instead of held as a `pub const`.
 ///
 /// This is a foundation-era knob and may be replaced once mesh
 /// multiplexing lands (one queue carrying tagged messages from N stages
 /// instead of N meshes), at which point the right user knob is more
 /// likely a per-query DSM cap than a raw per-edge byte count.
 static MPP_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
+
+/// Per-edge queue cap for a pure-join launch: one with no DISTINCT or aggregate,
+/// so its mesh carries only narrow broadcast and shuffle batches, never a large
+/// partial-aggregate frame. Because Postgres commits the whole region up front,
+/// the full `mpp_queue_size` is a launch cost the light join shapes don't need
+/// (it ran ~45ms just to reserve ~256MB). Capping their launch here keeps that
+/// cost proportional to what they actually send. Capped, not set, so a site that
+/// lowers `mpp_queue_size` below this still wins.
+pub const PURE_JOIN_QUEUE_MAX: usize = 16 * 1024 * 1024;
 
 /// Per-source-per-worker build-side cache slot size (bytes). The build-side
 /// all-gather reserves N slots of this size in DSM; total cache reservation
