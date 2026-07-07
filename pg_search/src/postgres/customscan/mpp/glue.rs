@@ -113,6 +113,12 @@ pub fn producer_worker_count() -> u32 {
     mpp_worker_count() - 1
 }
 
+/// The leader's control senders behind their shared lock. The scan state, the mesh's cancel
+/// path, and the `on_dsm_detach` callback all hold the same `Arc<ControlSenders>`; the
+/// callback's `Arc::from_raw` cast relies on this alias being the single definition of the
+/// pointee type.
+pub type ControlSenders = std::sync::Mutex<Vec<Option<MppSender>>>;
+
 /// Returned to the leader from [`leader_setup`]. The customscan stashes this on its execution
 /// state and consults it during `exec_custom_scan`.
 ///
@@ -134,7 +140,7 @@ pub struct MppLeaderState {
     /// (registered via `on_dsm_detach` by `launch`) clears them on every other path — abort, and a
     /// `proc_exit` from `pg_terminate_backend` that skips shutdown — always before PG unmaps the
     /// segment. The scan state's own drop runs after detach and must find this empty.
-    pub control_senders: Arc<std::sync::Mutex<Vec<Option<MppSender>>>>,
+    pub control_senders: Arc<ControlSenders>,
     /// Plans for [`deliver_set_plans`], which runs at exec time when the launched workers are
     /// draining their inboxes. Sending from the init callback instead could fill a small ring
     /// with no drainer behind it and wedge the leader. Kept (not drained) so a parallel rescan
@@ -242,12 +248,11 @@ pub unsafe fn leader_setup(
 /// `arg` is the senders `Arc`, leaked via `Arc::into_raw` at registration; reclaiming it here
 /// balances that. Idempotent — `clear` on the already-empty Vec (success path) is a no-op.
 #[pgrx::pg_guard]
-pub(crate) unsafe extern "C-unwind" fn release_control_senders_on_detach(
+unsafe extern "C-unwind" fn release_control_senders_on_detach(
     _seg: *mut pg_sys::dsm_segment,
     arg: pg_sys::Datum,
 ) {
-    let senders =
-        unsafe { Arc::from_raw(arg.cast_mut_ptr::<std::sync::Mutex<Vec<Option<MppSender>>>>()) };
+    let senders = unsafe { Arc::from_raw(arg.cast_mut_ptr::<ControlSenders>()) };
     // Tolerate a poisoned mutex rather than panic across the C boundary; the Vec data is still
     // valid to clear.
     let mut guard = senders
@@ -281,6 +286,9 @@ impl MppLeaderState {
     /// `shutdown_custom_scan` on the success path; [`release_control_senders_on_detach`] (registered
     /// via `on_dsm_detach`) covers every other teardown path. Idempotent.
     pub fn release_control_senders(&self) {
+        // Unlike the detach callback, a poisoned lock panics here on purpose: this runs on the
+        // success path inside the executor, where poison means a real bug and an ERROR is safe
+        // to raise. The callback can't afford that mid-`dsm_detach`.
         self.control_senders.lock().unwrap().clear();
     }
 }

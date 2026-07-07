@@ -636,8 +636,9 @@ impl CustomScan for AggregateScan {
             // Release the DSM-backed control senders before `recv`. A producer's `work_mem`
             // overflow (or any worker error) is re-raised in the leader from inside `recv`, which
             // longjmps out of this hook; a release placed after it would never run, leaving the
-            // senders to drop at xact commit, past the DSM's lifetime, where their `fetch_sub`
-            // faults. The query is done producing here, so the senders aren't needed.
+            // senders to `release_control_senders_on_detach`, which clears them at abort while
+            // the mapping is still live. The query is done producing here, so the senders aren't
+            // needed.
             if let Some(leader) = df_state.mpp.as_ref() {
                 leader.release_control_senders();
             }
