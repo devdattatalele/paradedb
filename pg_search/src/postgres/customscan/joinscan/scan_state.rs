@@ -883,7 +883,7 @@ fn build_distinct_address_deferral(
             rebuild: Some(DeferredLookupRebuild {
                 field_name: deferrable.name.clone(),
                 field_type: deferrable.field_type,
-                np_source_idx,
+                np_source_idx: Some(np_source_idx),
             }),
         },
     );

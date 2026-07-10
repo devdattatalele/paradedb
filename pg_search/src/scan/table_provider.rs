@@ -328,15 +328,14 @@ impl PgSearchTableProvider {
                         indexrelid: self.scan_info.indexrelid.to_u32(),
                         ff_index,
                     },
-                    // Replicated canonical segments make the column resolvable from any
-                    // fragment; the partitioning source's segments are claimed per worker,
-                    // so a cross-fragment rebuild there could not see every address.
-                    rebuild: self.non_partitioning_index.map(|np_source_idx| {
-                        crate::scan::late_materialization::DeferredLookupRebuild {
-                            field_name: name.clone(),
-                            field_type: *field_type,
-                            np_source_idx,
-                        }
+                    // Resolvable from any fragment: a non-partitioning source reads the
+                    // replicated canonical set, the partitioning source reads the full list in
+                    // the worker's `ParallelScanState` (claiming only divides the scan, not a
+                    // reader opened over the whole list).
+                    rebuild: Some(crate::scan::late_materialization::DeferredLookupRebuild {
+                        field_name: name.clone(),
+                        field_type: *field_type,
+                        np_source_idx: self.non_partitioning_index,
                     }),
                 });
             }

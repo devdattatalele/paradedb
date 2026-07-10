@@ -193,7 +193,7 @@ use crate::DEFAULT_PARAMETERIZED_LIMIT_ESTIMATE;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
-use datafusion_distributed::{display_plan_ascii, DistributedExec};
+use datafusion_distributed::{display_plan_ascii, DistributedExec, DistributedExt};
 use pgrx::{pg_guard, pg_sys, PgList};
 use std::ffi::{c_void, CStr};
 use std::sync::Arc;
@@ -1609,17 +1609,10 @@ impl CustomScan for JoinScan {
                             prep, &plan,
                         ) {
                             Some(leader) => {
-                                // Workers are attaching and draining after the commit; ship each
-                                // fragment's plan frame now, before anything pulls from the mesh.
-                                if let Err(e) =
-                                    crate::postgres::customscan::mpp::glue::deliver_set_plans(
-                                        &leader,
-                                    )
-                                {
-                                    pgrx::error!("mpp join: plan delivery failed: {e}");
-                                }
+                                let source = crate::postgres::customscan::mpp::glue::StagePlanDispatchSource::default();
                                 let exec_ctx =
-                                    Self::build_mpp_session_context(Some(Arc::clone(&leader.mesh)));
+                                    Self::build_mpp_session_context(Some(Arc::clone(&leader.mesh)))
+                                        .with_distributed_dispatch_plan_source(source);
                                 launch_us.payload_us = leader.timing.payload_us;
                                 launch_us.attach_us = leader.timing.attach_us;
                                 launch_us.leader_setup_us = leader.timing.leader_setup_us;

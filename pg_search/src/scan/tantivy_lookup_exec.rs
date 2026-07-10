@@ -162,6 +162,7 @@ impl TantivyLookupExec {
         input: Arc<dyn ExecutionPlan>,
         mut ffhelpers: HashMap<u32, Arc<FFHelper>>,
         non_partitioning_segment_ids: &[crate::api::HashSet<tantivy::index::SegmentId>],
+        parallel_state: Option<*mut crate::postgres::ParallelScanState>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let deferred_fields: Vec<PhysicalDeferredField> =
             serde_json::from_slice(buf).map_err(|e| {
@@ -173,7 +174,10 @@ impl TantivyLookupExec {
             &deferred_fields,
             &input.schema(),
             &mut ffhelpers,
-            LookupRebuildContext::Worker(non_partitioning_segment_ids),
+            LookupRebuildContext::Worker {
+                non_partitioning_segment_ids,
+                parallel_state,
+            },
         )?;
         Ok(Arc::new(TantivyLookupExec::new(
             input,
@@ -186,12 +190,83 @@ impl TantivyLookupExec {
 /// Which snapshot a rebuilt fast-field reader reads. Both decode paths reach the same segments
 /// in the same order the addresses were packed against, they just resolve the set differently.
 #[derive(Clone, Copy)]
-enum LookupRebuildContext<'a> {
+pub(crate) enum LookupRebuildContext<'a> {
     /// Planner path (serial plan): a snapshot reader sees the scan's segments directly.
     Snapshot,
-    /// MPP worker path: each source's replicated canonical segment set, indexed by the source's
-    /// non-partitioning position.
-    Worker(&'a [crate::api::HashSet<tantivy::index::SegmentId>]),
+    /// MPP worker path: a non-partitioning source reads its replicated canonical segment set;
+    /// the partitioning source reads the full list in the worker's `ParallelScanState` (the
+    /// same view its scan's reader opens, so segment ordering matches the packed addresses).
+    Worker {
+        non_partitioning_segment_ids: &'a [crate::api::HashSet<tantivy::index::SegmentId>],
+        parallel_state: Option<*mut crate::postgres::ParallelScanState>,
+    },
+}
+
+/// Resolve the segment view a rebuilt helper opens for one deferred column's index.
+pub(crate) fn rebuild_mvcc(
+    context: LookupRebuildContext,
+    rebuild: &crate::scan::late_materialization::DeferredLookupRebuild,
+) -> Result<MvccSatisfies> {
+    match context {
+        LookupRebuildContext::Snapshot => Ok(MvccSatisfies::Snapshot),
+        LookupRebuildContext::Worker {
+            non_partitioning_segment_ids,
+            parallel_state,
+        } => match rebuild.np_source_idx {
+            Some(np_source_idx) => {
+                let ids = non_partitioning_segment_ids
+                    .get(np_source_idx)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "ffhelper rebuild: missing canonical segment ids for \
+                             non-partitioning source {np_source_idx}"
+                        ))
+                    })?;
+                Ok(MvccSatisfies::ParallelWorker(ids))
+            }
+            None => {
+                let ps = parallel_state.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "ffhelper rebuild: partitioning source needs a ParallelScanState".into(),
+                    )
+                })?;
+                Ok(MvccSatisfies::ParallelWorker(unsafe {
+                    crate::postgres::customscan::parallel::list_segment_ids(ps)
+                }))
+            }
+        },
+    }
+}
+
+/// Open a fast-field helper for `indexrelid` with each rebuild entry laid out at its original
+/// `ff_index` (`Junk` fills the gaps), over the segment view `mvcc` picks.
+pub(crate) fn open_rebuilt_ffhelper(
+    indexrelid: u32,
+    entries: &[(
+        usize,
+        &crate::scan::late_materialization::DeferredLookupRebuild,
+    )],
+    mvcc: MvccSatisfies,
+) -> Result<Arc<FFHelper>> {
+    let index_rel = PgSearchRelation::open(pgrx::pg_sys::Oid::from(indexrelid));
+    let reader = SearchIndexReader::open_with_context(
+        &index_rel,
+        SearchQueryInput::All,
+        /* need_scores */ false,
+        mvcc,
+        None,
+        None,
+        /* needs_tokenizer_manager */ false,
+    )
+    .map_err(|e| DataFusionError::Internal(format!("ffhelper rebuild: open reader: {e}")))?;
+
+    let width = entries.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
+    let mut which: Vec<WhichFastField> = vec![WhichFastField::Junk(String::new()); width];
+    for (ff_index, rb) in entries {
+        which[*ff_index] = WhichFastField::Named(rb.field_name.clone(), rb.field_type);
+    }
+    Ok(Arc::new(FFHelper::with_fields(&reader, &which)))
 }
 
 /// Planner-side helper rebuild for address-mode lookups: a snapshot reader sees the same
@@ -223,62 +298,52 @@ fn rebuild_missing_ffhelpers(
     ffhelpers: &mut HashMap<u32, Arc<FFHelper>>,
     context: LookupRebuildContext,
 ) -> Result<()> {
-    // Group by index so two columns of the same index share one reader, laid out at their
-    // original `ff_index` positions (`Junk` fills the gaps). Only address-typed columns (plain
-    // `UInt64`, the DISTINCT rewrite) rebuild; they OVERRIDE any helper collected from a scan,
-    // whose projection-pruned field list no longer lines up with `canonical.ff_index`.
-    let mut per_index: HashMap<u32, Vec<&PhysicalDeferredField>> = HashMap::default();
+    // Decide which indexes rebuild. Address-typed columns (plain `UInt64`, the DISTINCT
+    // rewrite) always do: they OVERRIDE any helper collected from a scan, whose
+    // projection-pruned field list no longer lines up with `canonical.ff_index`. Ordinal-typed
+    // columns keep a scan's helper when one decoded in this fragment (its layout lines up by
+    // construction); they rebuild only on a worker whose fragment has that scan behind a
+    // network boundary.
+    let mut rebuild_indexes: crate::api::HashSet<u32> = Default::default();
     for f in deferred_fields {
+        if f.rebuild.is_none() {
+            continue;
+        }
         let is_address_col = input_schema
             .fields()
             .get(f.col_idx)
             .map(|fld| matches!(fld.data_type(), DataType::UInt64))
             .unwrap_or(false);
-        if f.rebuild.is_some() && is_address_col {
+        let scan_is_elsewhere = matches!(context, LookupRebuildContext::Worker { .. })
+            && !ffhelpers.contains_key(&f.canonical.indexrelid);
+        if is_address_col || scan_is_elsewhere {
+            rebuild_indexes.insert(f.canonical.indexrelid);
+        }
+    }
+
+    // Group by index so two columns of the same index share one reader, and lay out every
+    // rebuildable column of a rebuilding index, not just the ones that triggered it: the
+    // rebuilt helper replaces the map entry, so it has to serve all of them.
+    let mut per_index: HashMap<u32, Vec<&PhysicalDeferredField>> = HashMap::default();
+    for f in deferred_fields {
+        if f.rebuild.is_some() && rebuild_indexes.contains(&f.canonical.indexrelid) {
             per_index.entry(f.canonical.indexrelid).or_default().push(f);
         }
     }
 
     for (indexrelid, fields) in per_index {
-        let mvcc = match context {
-            LookupRebuildContext::Worker(np_ids) => {
-                let np_source_idx = fields[0].rebuild.as_ref().unwrap().np_source_idx;
-                let ids = np_ids.get(np_source_idx).cloned().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "TantivyLookupExec dispatch: missing canonical segment ids for \
-                         non-partitioning source {np_source_idx}"
-                    ))
-                })?;
-                MvccSatisfies::ParallelWorker(ids)
-            }
-            LookupRebuildContext::Snapshot => MvccSatisfies::Snapshot,
-        };
-        let index_rel = PgSearchRelation::open(pgrx::pg_sys::Oid::from(indexrelid));
-        let reader = SearchIndexReader::open_with_context(
-            &index_rel,
-            SearchQueryInput::All,
-            /* need_scores */ false,
-            mvcc,
-            None,
-            None,
-            /* needs_tokenizer_manager */ false,
-        )
-        .map_err(|e| {
-            DataFusionError::Internal(format!("TantivyLookupExec dispatch: open reader: {e}"))
-        })?;
-
-        let width = fields
+        let mvcc = rebuild_mvcc(context, fields[0].rebuild.as_ref().unwrap())?;
+        let entries: Vec<(
+            usize,
+            &crate::scan::late_materialization::DeferredLookupRebuild,
+        )> = fields
             .iter()
-            .map(|f| f.canonical.ff_index + 1)
-            .max()
-            .unwrap_or(0);
-        let mut which: Vec<WhichFastField> = vec![WhichFastField::Junk(String::new()); width];
-        for f in &fields {
-            let rb = f.rebuild.as_ref().unwrap();
-            which[f.canonical.ff_index] =
-                WhichFastField::Named(rb.field_name.clone(), rb.field_type);
-        }
-        ffhelpers.insert(indexrelid, Arc::new(FFHelper::with_fields(&reader, &which)));
+            .map(|f| (f.canonical.ff_index, f.rebuild.as_ref().unwrap()))
+            .collect();
+        ffhelpers.insert(
+            indexrelid,
+            open_rebuilt_ffhelper(indexrelid, &entries, mvcc)?,
+        );
     }
     Ok(())
 }
