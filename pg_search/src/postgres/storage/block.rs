@@ -33,10 +33,12 @@ use serde::{Deserialize, Serialize};
 use tantivy::index::{SegmentComponent, SegmentId};
 use tantivy::Opstamp;
 
-pub(crate) const VECTOR_ASSIGNMENTS_EXT: &str = "assignments";
-pub(crate) const VECTOR_FLAT_EXT: &str = "flatvec";
-pub(crate) const VECTOR_IVF_EXT: &str = "vec";
-pub(crate) const VECTOR_META_EXT: &str = "vecmeta";
+/// Extensions of tantivy's per-segment vector files. These mirror tantivy's
+/// (`pub(crate)`) `vector::VEC_EXT` and `vector::ivf::CENTROIDS_EXT`: `.vec`
+/// is written for every segment with a vector field (both storage layouts),
+/// `.centroids` only for IVF (clustered) segments.
+pub(crate) const VECTOR_VEC_EXT: &str = "vec";
+pub(crate) const VECTOR_CENTROIDS_EXT: &str = "centroids";
 
 // ---------------------------------------------------------
 // BM25 page special data
@@ -280,10 +282,8 @@ pub struct SegmentMetaEntryImmutable {
     pub store: Option<FileEntry>,
     pub temp_store: Option<FileEntry>,
     pub delete: Option<DeleteEntry>,
-    pub vecmeta: Option<FileEntry>,
-    pub flatvec: Option<FileEntry>,
-    pub assignments: Option<FileEntry>,
-    pub ivf_vec: Option<FileEntry>,
+    pub vec: Option<FileEntry>,
+    pub centroids: Option<FileEntry>,
 }
 
 /// The pre-vector on-disk layout of [`SegmentMetaEntryImmutable`]. Indexes built before vector
@@ -357,26 +357,16 @@ impl SegmentMetaEntryImmutable {
                     .map(|d| (&d.file_entry, SegmentComponent::Delete)),
             )
             .chain(
-                self.vecmeta
+                self.vec
                     .iter()
-                    .map(|fe| (fe, SegmentComponent::Custom(VECTOR_META_EXT.to_string()))),
+                    .map(|fe| (fe, SegmentComponent::Custom(VECTOR_VEC_EXT.to_string()))),
             )
-            .chain(
-                self.flatvec
-                    .iter()
-                    .map(|fe| (fe, SegmentComponent::Custom(VECTOR_FLAT_EXT.to_string()))),
-            )
-            .chain(self.assignments.iter().map(|fe| {
+            .chain(self.centroids.iter().map(|fe| {
                 (
                     fe,
-                    SegmentComponent::Custom(VECTOR_ASSIGNMENTS_EXT.to_string()),
+                    SegmentComponent::Custom(VECTOR_CENTROIDS_EXT.to_string()),
                 )
             }))
-            .chain(
-                self.ivf_vec
-                    .iter()
-                    .map(|fe| (fe, SegmentComponent::Custom(VECTOR_IVF_EXT.to_string()))),
-            )
     }
 }
 
@@ -692,22 +682,12 @@ impl SegmentMetaEntry {
             .map(|entry| entry.file_entry.total_bytes as u64)
             .unwrap_or(0);
         size += content
-            .vecmeta
+            .vec
             .as_ref()
             .map(|entry| entry.total_bytes as u64)
             .unwrap_or(0);
         size += content
-            .flatvec
-            .as_ref()
-            .map(|entry| entry.total_bytes as u64)
-            .unwrap_or(0);
-        size += content
-            .assignments
-            .as_ref()
-            .map(|entry| entry.total_bytes as u64)
-            .unwrap_or(0);
-        size += content
-            .ivf_vec
+            .centroids
             .as_ref()
             .map(|entry| entry.total_bytes as u64)
             .unwrap_or(0);
@@ -804,12 +784,10 @@ impl From<PgItem> for SegmentMetaEntry {
 
                 // Segments written before vector support lack the trailing vector file entries.
                 // bincode has no field framing, so decode them only when bytes remain.
-                let (vecmeta, flatvec, assignments, ivf_vec): (
-                    Option<FileEntry>,
-                    Option<FileEntry>,
-                    Option<FileEntry>,
-                    Option<FileEntry>,
-                ) = if content_bytes.len() > v1_len {
+                let (vec, centroids): (Option<FileEntry>, Option<FileEntry>) = if content_bytes
+                    .len()
+                    > v1_len
+                {
                     bincode::serde::decode_from_slice(
                         &content_bytes[v1_len..],
                         bincode::config::legacy(),
@@ -817,7 +795,7 @@ impl From<PgItem> for SegmentMetaEntry {
                     .expect("expected to deserialize valid SegmentMetaEntry vector file entries")
                     .0
                 } else {
-                    (None, None, None, None)
+                    (None, None)
                 };
 
                 SegmentMetaEntryContent::Immutable(SegmentMetaEntryImmutable {
@@ -829,10 +807,8 @@ impl From<PgItem> for SegmentMetaEntry {
                     store: v1.store,
                     temp_store: v1.temp_store,
                     delete: v1.delete,
-                    vecmeta,
-                    flatvec,
-                    assignments,
-                    ivf_vec,
+                    vec,
+                    centroids,
                 })
             }
             SegmentMetaEntryTag::Mutable => {
