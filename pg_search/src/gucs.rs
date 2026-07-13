@@ -223,25 +223,33 @@ static TERM_SET_BITSET_MAX_DENSITY_UNIQUE: GucSetting<f64> = GucSetting::<f64>::
 /// `tantivy::query::TermSetStrategyConfig::default()`.
 static TERM_SET_BITSET_MAX_DENSITY_MULTI: GucSetting<f64> = GucSetting::<f64>::new(1.0 / 200.0);
 
-/// Per-segment IVF cluster fanout cap for vector search. `0.1` means
-/// probe at most 10% of a segment's IVF clusters, rounded up; `1.0`
-/// means no cap beyond the segment's cluster count.
-static VECTOR_CLUSTER_PROBE_FANOUT: GucSetting<f64> = GucSetting::<f64>::new(0.1);
+/// Absolute per-segment cap on the number of IVF clusters probed by a
+/// vector ORDER BY query, clamped at query time to the segment's
+/// cluster count (segments with fewer clusters scan exhaustively).
+/// Mirrors SPANN's absolute posting-list budget and the `nprobe`
+/// mental model pgvector users bring. Default 128: SPANN Fig. 2 shows
+/// 99% of SIFT1M queries reach perfect recall@1 within 114 postings.
+static VECTOR_CLUSTER_MAX_PROBES: GucSetting<i32> = GucSetting::<i32>::new(128);
 
-pub fn vector_cluster_probe_fanout() -> f32 {
-    VECTOR_CLUSTER_PROBE_FANOUT.get() as f32
+pub fn vector_cluster_max_probes() -> usize {
+    VECTOR_CLUSTER_MAX_PROBES.get() as usize
 }
 
 /// SPANN-style query-time pruning factor (ε₂) used by tantivy's
-/// `AdaptiveProbeParams`. A cluster `c` is probed iff
-/// `dist(q, c) <= (1 + epsilon) * dist(q, c_best)`. Higher values
-/// widen the probe radius (better recall, more latency); `0` makes
-/// the algorithm stop as soon as `min_probe_fanout` / `min_candidates`
-/// floors are met. Default `1.0` is chosen to saturate the
-/// `vector_cluster_probe_fanout` cap on Cohere-like 768d workloads;
-/// tantivy's upstream default is 0.3, and the SPANN paper uses 0.6
-/// for recall@1 and 7.0 for recall@10.
-static VECTOR_CLUSTER_PROBE_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.0);
+/// `AdaptiveProbeParams`. A cluster `c` is probed iff its per-metric
+/// distance ratio stays within `(1 + epsilon)` of the best centroid:
+/// L2 gates on squared distance (`d² <= (1 + ε) * d²_min`), cosine on
+/// the angular ratio (`(1 - cos) <= (1 + ε) * (1 - cos_best)`), and
+/// raw dot-product — which has no natural distance ratio — gets a
+/// linear similarity band where the probe ceiling effectively governs.
+/// `0` stops as soon as the `min_candidates` floor is met; higher
+/// values widen the probe radius (better recall, more latency).
+/// Default `7.0` is SPANN's recall@10-tuned ε₂ (the paper uses 0.6
+/// for recall@1; SPTAG ships `MaxDistRatio = 8.0`, i.e. `1 + 7.0`).
+/// Values tuned against the old formulation (e.g. the previous `1.0`
+/// default) do not transfer — cosine previously gated on a different
+/// quantity — re-benchmark.
+static VECTOR_CLUSTER_PROBE_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(7.0);
 
 pub fn vector_cluster_probe_epsilon() -> f32 {
     VECTOR_CLUSTER_PROBE_EPSILON.get() as f32
@@ -452,13 +460,13 @@ pub fn init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_float_guc(
-        c"paradedb.vector_cluster_probe_fanout",
-        c"IVF cluster probe fanout cap for vector ORDER BY queries",
-        c"Caps the fraction of IVF clusters per segment whose docs may be scored on a vector ORDER BY query. 0.1 probes at most 10% of clusters, rounded up; 1.0 allows all clusters. Lower values reduce latency at the cost of recall.",
-        &VECTOR_CLUSTER_PROBE_FANOUT,
-        0.000001,
-        1.0,
+    GucRegistry::define_int_guc(
+        c"paradedb.vector_cluster_max_probes",
+        c"Per-segment IVF cluster probe ceiling for vector ORDER BY queries",
+        c"Absolute cap on the number of IVF clusters probed per segment on a vector ORDER BY query, clamped to the segment's cluster count (segments with fewer clusters scan all of them). Mirrors SPANN's absolute posting-list budget and pgvector's nprobe. Lower values reduce latency at the cost of recall.",
+        &VECTOR_CLUSTER_MAX_PROBES,
+        1,
+        65536,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -466,7 +474,7 @@ pub fn init() {
     GucRegistry::define_float_guc(
         c"paradedb.vector_cluster_probe_epsilon",
         c"SPANN-style pruning factor (ε₂) for vector ORDER BY queries",
-        c"Geometric widening factor that controls how far past the best centroid the IVF probe loop is allowed to continue. A cluster c is probed iff dist(q, c) <= (1 + epsilon) * dist(q, c_best). 0 stops as soon as the candidate floor is met; larger values widen the probe radius for better recall at higher latency. Bounded by paradedb.vector_cluster_probe_fanout.",
+        c"Distance-ratio gate on how far past the best centroid the IVF probe loop continues, on the metric's own distance: L2 probes cluster c while d(q,c)^2 <= (1 + epsilon) * d(q,c_best)^2; cosine while (1 - cos(q,c)) <= (1 + epsilon) * (1 - cos(q,c_best)); raw dot-product has no distance ratio, so the probe ceiling (paradedb.vector_cluster_max_probes) effectively governs. 0 stops as soon as the candidate floor is met; larger values widen the probe radius for better recall at higher latency. SPANN uses 0.6 (recall@1) to 7.0 (recall@10); SPTAG ships MaxDistRatio = 8.0 = 1 + 7.0. Values tuned against the old formulation (e.g. the previous default of 1.0) do not transfer, especially for cosine — re-benchmark.",
         &VECTOR_CLUSTER_PROBE_EPSILON,
         0.0,
         100.0,

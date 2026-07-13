@@ -971,8 +971,8 @@ impl SearchIndexReader {
                     .and_offset(offset)
                     .order_by_similarity(tantivy_field, query_vector.clone())
                     .with_adaptive_params(AdaptiveProbeParams {
-                        max_probe_fanout: crate::gucs::vector_cluster_probe_fanout(),
                         epsilon: crate::gucs::vector_cluster_probe_epsilon(),
+                        max_probe_count: crate::gucs::vector_cluster_max_probes(),
                         ..Default::default()
                     });
                 // Probe-stats NOTICE (GUC `paradedb.log_probe_stats`, off by

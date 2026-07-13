@@ -372,7 +372,13 @@ fn index_info(
                             .delete
                             .map(|file| file.file_entry.total_bytes.into()),
                         vector_info.map(|(field_name, _)| field_name.clone()),
-                        vector_info.map(|(_, vector_info)| vector_info.format.as_str().to_string()),
+                        vector_info.map(|(_, vector_info)| {
+                            match vector_info.format {
+                                tantivy::vector::VectorStorageFormat::Flat => "flat",
+                                tantivy::vector::VectorStorageFormat::Ivf => "ivf",
+                            }
+                            .to_string()
+                        }),
                         vector_info.map(|(_, vector_info)| vector_info.num_vectors.into()),
                         vector_info
                             .and_then(|(_, vector_info)| vector_info.num_centroids)

@@ -33,15 +33,10 @@ pub struct SuperKMeansIvfClusterer {
     centroid_ratio: f32,
     training_samples_per_centroid: usize,
     assign_batch_size: usize,
-    /// Hard cap on primary cluster size. `None` => balancing off on this side
-    /// (no splitting); the merge driver leaves oversized clusters intact.
-    max_posting_len: Option<usize>,
-    /// Floor on primary cluster size. `None` => balancing off on this side (no
-    /// dissolving); the merge driver leaves undersized clusters intact.
-    min_posting_len: Option<usize>,
     /// Total cells a vector is written into (SPANN `ReplicaCount`). `1` (the
-    /// default) is primary-only Phase 1; `> 1` adds up to `replicas - 1` HNSW-
-    /// nearest cells at merge time.
+    /// default) is primary-only Phase 1; `> 1` adds up to `replicas - 1`
+    /// next-nearest cells at merge time, selected by tantivy's centroid
+    /// selector (exact scan or `RelativeNeighborhoodGraph`).
     replicas: usize,
 }
 
@@ -57,8 +52,6 @@ impl Default for SuperKMeansIvfClusterer {
             centroid_ratio: 0.01,
             training_samples_per_centroid: 32,
             assign_batch_size: DEFAULT_ASSIGN_BATCH_SIZE,
-            max_posting_len: None,
-            min_posting_len: None,
             replicas: 1,
         }
     }
@@ -79,16 +72,6 @@ impl SuperKMeansIvfClusterer {
         training_samples_per_centroid: usize,
     ) -> Self {
         self.training_samples_per_centroid = training_samples_per_centroid;
-        self
-    }
-
-    pub fn with_max_posting_len(mut self, max_posting_len: Option<usize>) -> Self {
-        self.max_posting_len = max_posting_len;
-        self
-    }
-
-    pub fn with_min_posting_len(mut self, min_posting_len: Option<usize>) -> Self {
-        self.min_posting_len = min_posting_len;
         self
     }
 
@@ -130,21 +113,14 @@ impl IvfClusterer for SuperKMeansIvfClusterer {
             ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
         let num_centroids = num_centroids.clamp(1, total_target_docs);
 
-        // Cluster balancing (split oversized / dissolve undersized primary
-        // clusters at merge) is OFF by default: an index that sets neither
-        // `max_posting_len` nor `min_posting_len` keeps the raw clusters from
-        // superkmeans. `usize::MAX` disables splitting, `0` disables dissolving
-        // (see `IvfMergeSettings`); an explicitly set option re-enables that
-        // side of the band with its bound.
-        let max_posting_len = self.max_posting_len.unwrap_or(usize::MAX);
-        let min_posting_len = self.min_posting_len.unwrap_or(0);
-
         Ok(IvfMergeSettings {
             num_centroids,
             training_samples_per_centroid,
             assign_batch_size,
-            max_posting_len,
-            min_posting_len,
+            // Replica cells (the `replicas - 1` non-primary cells per vector)
+            // are selected by tantivy in the field's raw metric —
+            // router-consistent with query-time `rank_centroids`. No angular
+            // assumption on this clusterer remains.
             replicas: self.replicas.max(1),
         })
     }
@@ -278,8 +254,6 @@ pub fn set_ivf_clusterer(index: &mut Index, options: &BM25IndexOptions) {
     let clusterer = SuperKMeansIvfClusterer::new()
         .with_centroid_ratio(options.centroid_ratio())
         .with_training_samples_per_centroid(options.training_samples_per_centroid())
-        .with_max_posting_len(options.max_posting_len())
-        .with_min_posting_len(options.min_posting_len())
         .with_replicas(options.replicas());
     index.set_ivf_clusterer(Arc::new(clusterer));
 }
@@ -295,24 +269,26 @@ fn to_tantivy_error(error: SuperKMeansError) -> TantivyError {
 mod tests {
     use super::*;
 
-    /// Cluster balancing is OFF by default: with no posting-len options set,
-    /// `merge_settings` disables splitting (`usize::MAX`) and dissolving (`0`),
-    /// leaving the raw superkmeans clusters. Explicit options re-enable it.
+    /// Replication is off by default (`replicas = 1`), and non-positive
+    /// configured values clamp to `1` rather than disabling clustering.
     #[test]
-    fn balancing_off_by_default() {
+    fn replicas_default_and_clamp() {
         let total = 100_000;
         let settings = SuperKMeansIvfClusterer::new()
             .merge_settings(total)
             .unwrap();
-        assert_eq!(settings.max_posting_len, usize::MAX, "splitting disabled");
-        assert_eq!(settings.min_posting_len, 0, "dissolving disabled");
+        assert_eq!(settings.replicas, 1, "primary-only by default");
 
-        let bounded = SuperKMeansIvfClusterer::new()
-            .with_max_posting_len(Some(512))
-            .with_min_posting_len(Some(8))
+        let replicated = SuperKMeansIvfClusterer::new()
+            .with_replicas(4)
             .merge_settings(total)
             .unwrap();
-        assert_eq!(bounded.max_posting_len, 512);
-        assert_eq!(bounded.min_posting_len, 8);
+        assert_eq!(replicated.replicas, 4);
+
+        let clamped = SuperKMeansIvfClusterer::new()
+            .with_replicas(0)
+            .merge_settings(total)
+            .unwrap();
+        assert_eq!(clamped.replicas, 1, "non-positive clamps to primary-only");
     }
 }

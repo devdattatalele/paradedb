@@ -202,7 +202,7 @@ fn cstr_to_rust_str(value: *const std::os::raw::c_char) -> String {
         .to_string()
 }
 
-const NUM_REL_OPTS: usize = 19;
+const NUM_REL_OPTS: usize = 17;
 #[pg_guard]
 pub unsafe extern "C-unwind" fn amoptions(
     reloptions: pg_sys::Datum,
@@ -324,20 +324,6 @@ pub unsafe extern "C-unwind" fn amoptions(
             isset_offset: 0,
         },
         pg_sys::relopt_parse_elt {
-            optname: "max_posting_len".as_pg_cstr(),
-            opttype: pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset: std::mem::offset_of!(BM25IndexOptionsData, max_posting_len) as i32,
-            #[cfg(feature = "pg18")]
-            isset_offset: 0,
-        },
-        pg_sys::relopt_parse_elt {
-            optname: "min_posting_len".as_pg_cstr(),
-            opttype: pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset: std::mem::offset_of!(BM25IndexOptionsData, min_posting_len) as i32,
-            #[cfg(feature = "pg18")]
-            isset_offset: 0,
-        },
-        pg_sys::relopt_parse_elt {
             optname: "replicas".as_pg_cstr(),
             opttype: pg_sys::relopt_type::RELOPT_TYPE_INT,
             offset: std::mem::offset_of!(BM25IndexOptionsData, replicas) as i32,
@@ -435,14 +421,6 @@ impl BM25IndexOptions {
 
     pub fn training_samples_per_centroid(&self) -> usize {
         self.options_data().training_samples_per_centroid()
-    }
-
-    pub fn max_posting_len(&self) -> Option<usize> {
-        self.options_data().max_posting_len()
-    }
-
-    pub fn min_posting_len(&self) -> Option<usize> {
-        self.options_data().min_posting_len()
     }
 
     pub fn replicas(&self) -> usize {
@@ -742,8 +720,6 @@ struct BM25IndexOptionsData {
     search_tokenizer_offset: i32,
     centroid_ratio: f64,
     training_samples_per_centroid: i32,
-    max_posting_len: i32,
-    min_posting_len: i32,
     replicas: i32,
 }
 
@@ -792,33 +768,10 @@ impl BM25IndexOptionsData {
         self.training_samples_per_centroid.max(1) as usize
     }
 
-    /// Hard cap on IVF posting (cluster) length. `None` (the unset
-    /// sentinel `0`, or any non-positive value) leaves the merge driver on
-    /// its default cap, so an index that doesn't set this behaves exactly
-    /// as before the option existed.
-    pub fn max_posting_len(&self) -> Option<usize> {
-        if self.max_posting_len <= 0 {
-            None
-        } else {
-            Some(self.max_posting_len as usize)
-        }
-    }
-
-    /// Floor on IVF posting (cluster) length. `None` (the unset sentinel
-    /// `0`, or any non-positive value) leaves the merge driver on its
-    /// default floor. To effectively disable the floor, set `1` (only
-    /// empty clusters are then dissolved).
-    pub fn min_posting_len(&self) -> Option<usize> {
-        if self.min_posting_len <= 0 {
-            None
-        } else {
-            Some(self.min_posting_len as usize)
-        }
-    }
-
     /// Total cells a vector is written into (SPANN `ReplicaCount`): the primary
-    /// plus up to `replicas - 1` HNSW-nearest cells. `1` (the default) is
-    /// primary-only. Any non-positive value is treated as `1`.
+    /// plus up to `replicas - 1` next-nearest cells, selected by tantivy at
+    /// merge time in the field's metric. `1` (the default) is primary-only.
+    /// Any non-positive value is treated as `1`.
     pub fn replicas(&self) -> usize {
         if self.replicas <= 0 {
             1
@@ -1061,26 +1014,8 @@ pub unsafe fn init() {
     );
     pg_sys::add_int_reloption(
         RELOPT_KIND_PDB,
-        "max_posting_len".as_pg_cstr(),
-        "Hard cap on IVF posting length; clusters above this are split at merge time (0 = use default)".as_pg_cstr(),
-        0,
-        0,
-        i32::MAX,
-        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
-    );
-    pg_sys::add_int_reloption(
-        RELOPT_KIND_PDB,
-        "min_posting_len".as_pg_cstr(),
-        "Floor on IVF posting length; clusters below this are dissolved at merge time (0 = use default)".as_pg_cstr(),
-        0,
-        0,
-        i32::MAX,
-        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
-    );
-    pg_sys::add_int_reloption(
-        RELOPT_KIND_PDB,
         "replicas".as_pg_cstr(),
-        "Cells a vector is written into: primary + up to replicas-1 HNSW-nearest cells (1 = no replication)".as_pg_cstr(),
+        "Cells a vector is written into: primary + up to replicas-1 next-nearest cells (1 = no replication)".as_pg_cstr(),
         1,
         1,
         i32::MAX,

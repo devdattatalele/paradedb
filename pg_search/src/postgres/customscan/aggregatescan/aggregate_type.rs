@@ -525,7 +525,15 @@ impl From<AggregateType> for AggregationVariants {
                 AggregationVariants::Count(CountAggregation { field, missing })
             }
             AggregateType::Sum { field, missing, .. } => {
-                AggregationVariants::Sum(SumAggregation { field, missing })
+                // `none_if_no_match: None` keeps tantivy's Elasticsearch-style
+                // `0` for empty buckets — the behavior before the flag existed.
+                // The custom scan's own NULL handling stays in charge of
+                // Postgres' SUM-of-zero-rows-is-NULL semantics.
+                AggregationVariants::Sum(SumAggregation {
+                    field,
+                    missing,
+                    none_if_no_match: None,
+                })
             }
             AggregateType::Avg { field, missing, .. } => {
                 AggregationVariants::Average(AverageAggregation { field, missing })
